@@ -1,72 +1,35 @@
 # Bulk Mailer
 
-A small Go command-line tool for sending templated emails to many recipients using an SMTP server.
+A lightweight Go web app for sending a plain-text email to multiple recipients through your SMTP server. Run the server locally, open it in a browser, fill out the form, and click **Send Emails**.
 
-## Features
+## Getting started
 
-- Reads recipient data from a CSV file (first row used as column headers).
-- Renders the message body with Go's `text/template`, allowing per-recipient personalization.
-- Supports a `--dry-run` mode to preview outgoing messages without sending them.
-- Provides a helper `upper` template function for simple transformations.
+1. Install Go 1.24 or newer.
+2. Start the server:
 
-## Installation
+   ```bash
+   go run ./...
+   ```
 
-```bash
-go build
-```
+   The app listens on <http://localhost:8080> by default.
 
-This command produces a `bulkmailer` binary in the working directory.
+3. Open the URL in your browser. Provide the SMTP settings, compose your message, list recipients (one email address per line), and submit the form. The page reports success or failure for each recipient.
 
-## Usage
+## Form fields
 
-```bash
-./bulkmailer \
-  --smtp-server smtp.example.com \
-  --smtp-port 587 \
-  --smtp-username no-reply@example.com \
-  --smtp-password "app-specific-password" \
-  --from no-reply@example.com \
-  --subject "Hello {{.name}}" \
-  --body-template body.tmpl \
-  --recipients recipients.csv
-```
-
-- `--subject` accepts literal text; you can embed template expressions by rendering them in the body template instead.
-- `--body-template` points to a file using Go template syntax. Every column from the CSV becomes available in the template.
-- `--recipients` should contain an `email` column plus any other data you want to reference in the template.
-- `--dry-run` logs the generated messages without contacting the SMTP server.
-
-### Example files
-
-`recipients.csv`
-
-```csv
-email,name,favorite_color
-alex@example.com,Alex,blue
-casey@example.com,Casey,green
-```
-
-`body.tmpl`
-
-```
-Hi {{.name}},
-
-Your favorite color is {{upper .favorite_color}}.
-
-Best regards,
-Bulk Mailer Bot
-```
-
-Run in dry-run mode while testing:
-
-```bash
-./bulkmailer --dry-run --smtp-server smtp.example.com --smtp-port 587 \
-  --smtp-username no-reply@example.com --smtp-password ignored \
-  --from no-reply@example.com --subject "Greetings" \
-  --body-template body.tmpl --recipients recipients.csv
-```
+| Field | Description |
+| --- | --- |
+| SMTP Server | Hostname of your SMTP service (e.g. `smtp.example.com`). |
+| SMTP Port | Port number (commonly `587` for STARTTLS or `465` for SMTPS). |
+| SMTP Username | Username or email used to authenticate with the SMTP server. |
+| SMTP Password | Password or app-specific token for the SMTP user. |
+| From Address | Optional. If left empty, the SMTP username is used as the sender. |
+| Subject | Subject line for the outgoing email. |
+| Body | Plain-text body shared by every recipient. |
+| Recipients | Provide one email address per line. Blank lines are ignored. |
 
 ## Notes
 
-- The tool currently supports plain-text messages and SMTP authentication via the `PLAIN` mechanism. Ensure your SMTP server supports this.
-- When using `--dry-run`, the password flag can be left empty.
+- Passwords are never persisted on the page; you must re-enter the value for each send.
+- The server only sends plain-text emails and authenticates using the SMTP `PLAIN` mechanism via `net/smtp`.
+- For bulk mail, ensure you comply with your provider's sending limits and anti-spam policies.

@@ -1,190 +1,223 @@
 package main
 
 import (
-	"bytes"
-	"encoding/csv"
-	"errors"
-	"flag"
 	"fmt"
-	"io"
+	"html/template"
 	"log"
-	"os"
-	"strings"
-	"text/template"
-
+	"net/http"
 	"net/smtp"
+	"strconv"
+	"strings"
 )
 
-type Recipient map[string]string
+type pageData struct {
+	Form    formData
+	Results []sendResult
+	Error   string
+}
+
+type formData struct {
+	SMTPServer string
+	SMTPPort   string
+	SMTPUser   string
+	From       string
+	Subject    string
+	Body       string
+	Recipients string
+}
+
+type sendResult struct {
+	Recipient string
+	Success   bool
+	Message   string
+}
+
+var tmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Bulk Mailer</title>
+    <style>
+        body { font-family: sans-serif; margin: 2rem; }
+        form { max-width: 720px; display: grid; gap: 1rem; }
+        label { display: flex; flex-direction: column; font-weight: 600; }
+        input[type="text"], input[type="password"], textarea { padding: 0.5rem; font-size: 1rem; }
+        textarea { min-height: 10rem; }
+        .error { color: #b00020; font-weight: 600; }
+        .results { margin-top: 2rem; }
+        .result-success { color: #006400; }
+        .result-failure { color: #8b0000; }
+        button { padding: 0.75rem 1.5rem; font-size: 1rem; }
+    </style>
+</head>
+<body>
+    <h1>Bulk Mailer</h1>
+    <p>Send a plain-text email to multiple recipients by filling in the SMTP and message details below.</p>
+    {{if .Error}}
+    <p class="error">{{.Error}}</p>
+    {{end}}
+    <form method="post" action="/">
+        <label>SMTP Server
+            <input type="text" name="smtp_server" value="{{.Form.SMTPServer}}" required>
+        </label>
+        <label>SMTP Port
+            <input type="text" name="smtp_port" value="{{.Form.SMTPPort}}" required>
+        </label>
+        <label>SMTP Username
+            <input type="text" name="smtp_user" value="{{.Form.SMTPUser}}" required>
+        </label>
+        <label>SMTP Password
+            <input type="password" name="smtp_pass" value="" placeholder="Not stored" required>
+        </label>
+        <label>From Address
+            <input type="text" name="from" value="{{.Form.From}}" placeholder="Defaults to SMTP username">
+        </label>
+        <label>Subject
+            <input type="text" name="subject" value="{{.Form.Subject}}" required>
+        </label>
+        <label>Body
+            <textarea name="body" required>{{.Form.Body}}</textarea>
+        </label>
+        <label>Recipients (one email address per line)
+            <textarea name="recipients" required>{{.Form.Recipients}}</textarea>
+        </label>
+        <button type="submit">Send Emails</button>
+    </form>
+
+    {{if .Results}}
+    <div class="results">
+        <h2>Send Results</h2>
+        <ul>
+            {{range .Results}}
+            <li class="{{if .Success}}result-success{{else}}result-failure{{end}}">{{.Recipient}} — {{.Message}}</li>
+            {{end}}
+        </ul>
+    </div>
+    {{end}}
+</body>
+</html>`))
 
 func main() {
-	var (
-		smtpServer   = flag.String("smtp-server", "", "SMTP server hostname")
-		smtpPort     = flag.Int("smtp-port", 587, "SMTP server port")
-		smtpUser     = flag.String("smtp-username", "", "SMTP username")
-		smtpPassword = flag.String("smtp-password", "", "SMTP password")
-		fromAddress  = flag.String("from", "", "From email address (defaults to smtp-username)")
-		subject      = flag.String("subject", "", "Email subject line")
-		bodyPath     = flag.String("body-template", "", "Path to the body template file")
-		recipients   = flag.String("recipients", "", "Path to CSV file containing recipients")
-		dryRun       = flag.Bool("dry-run", false, "Log emails without sending")
-	)
+	http.HandleFunc("/", formHandler)
 
-	flag.Parse()
-
-	if err := run(*smtpServer, *smtpPort, *smtpUser, *smtpPassword, *fromAddress, *subject, *bodyPath, *recipients, *dryRun); err != nil {
-		log.Fatalf("%v", err)
+	addr := ":8080"
+	log.Printf("Listening on %s", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		log.Fatalf("failed to start server: %v", err)
 	}
 }
 
-func run(server string, port int, username, password, from, subject, bodyTemplatePath, recipientsPath string, dryRun bool) error {
-	if server == "" {
-		return errors.New("smtp-server is required")
-	}
-	if username == "" {
-		return errors.New("smtp-username is required")
-	}
-	if password == "" && !dryRun {
-		return errors.New("smtp-password is required unless dry-run is enabled")
-	}
-	if subject == "" {
-		return errors.New("subject is required")
-	}
-	if bodyTemplatePath == "" {
-		return errors.New("body-template is required")
-	}
-	if recipientsPath == "" {
-		return errors.New("recipients is required")
+func formHandler(w http.ResponseWriter, r *http.Request) {
+	data := pageData{
+		Form: formData{
+			SMTPPort: "587",
+		},
 	}
 
-	if from == "" {
-		from = username
-	}
-
-	tmpl, err := parseTemplate(bodyTemplatePath)
-	if err != nil {
-		return fmt.Errorf("failed to parse template: %w", err)
-	}
-
-	recipientsList, err := loadRecipients(recipientsPath)
-	if err != nil {
-		return fmt.Errorf("failed to load recipients: %w", err)
-	}
-
-	log.Printf("Loaded %d recipients", len(recipientsList))
-
-	for _, recipient := range recipientsList {
-		email, ok := recipient["email"]
-		if !ok || strings.TrimSpace(email) == "" {
-			log.Printf("Skipping recipient missing 'email' field: %#v", recipient)
-			continue
+	if r.Method == http.MethodPost {
+		if err := r.ParseForm(); err != nil {
+			data.Error = fmt.Sprintf("failed to parse form: %v", err)
+			renderTemplate(w, data)
+			return
 		}
 
-		body, err := renderBody(tmpl, recipient)
+		data.Form.SMTPServer = strings.TrimSpace(r.FormValue("smtp_server"))
+		data.Form.SMTPPort = strings.TrimSpace(r.FormValue("smtp_port"))
+		data.Form.SMTPUser = strings.TrimSpace(r.FormValue("smtp_user"))
+		password := strings.TrimSpace(r.FormValue("smtp_pass"))
+		data.Form.From = strings.TrimSpace(r.FormValue("from"))
+		data.Form.Subject = strings.TrimSpace(r.FormValue("subject"))
+		data.Form.Body = r.FormValue("body")
+		data.Form.Recipients = strings.TrimSpace(r.FormValue("recipients"))
+
+		if data.Form.SMTPServer == "" || data.Form.SMTPPort == "" || data.Form.SMTPUser == "" || data.Form.Subject == "" || data.Form.Body == "" || data.Form.Recipients == "" {
+			data.Error = "All fields except From are required."
+			renderTemplate(w, data)
+			return
+		}
+
+		port, err := strconv.Atoi(data.Form.SMTPPort)
 		if err != nil {
-			log.Printf("Failed to render template for %s: %v", email, err)
-			continue
+			data.Error = "SMTP Port must be a number."
+			renderTemplate(w, data)
+			return
 		}
 
-		msg, err := buildMessage(from, email, subject, body)
-		if err != nil {
-			log.Printf("Failed to build message for %s: %v", email, err)
-			continue
+		recipients := parseRecipients(data.Form.Recipients)
+		if len(recipients) == 0 {
+			data.Error = "Provide at least one recipient email address."
+			renderTemplate(w, data)
+			return
 		}
 
-		if dryRun {
-			log.Printf("[DRY RUN] Would send email to %s\n%s", email, msg)
-			continue
+		from := data.Form.From
+		if strings.TrimSpace(from) == "" {
+			from = data.Form.SMTPUser
 		}
 
-		if err := sendEmail(server, port, username, password, from, email, []byte(msg)); err != nil {
-			log.Printf("Failed to send email to %s: %v", email, err)
-			continue
+		if password == "" {
+			data.Error = "SMTP Password is required to send emails."
+			renderTemplate(w, data)
+			return
 		}
 
-		log.Printf("Sent email to %s", email)
+		results := make([]sendResult, 0, len(recipients))
+		for _, recipient := range recipients {
+			msg := buildMessage(from, recipient, data.Form.Subject, data.Form.Body)
+			err := sendEmail(data.Form.SMTPServer, port, data.Form.SMTPUser, password, from, recipient, []byte(msg))
+			if err != nil {
+				log.Printf("Failed to send email to %s: %v", recipient, err)
+				results = append(results, sendResult{
+					Recipient: recipient,
+					Success:   false,
+					Message:   err.Error(),
+				})
+				continue
+			}
+
+			results = append(results, sendResult{
+				Recipient: recipient,
+				Success:   true,
+				Message:   "sent successfully",
+			})
+		}
+
+		data.Results = results
 	}
 
-	return nil
+	renderTemplate(w, data)
 }
 
-func parseTemplate(path string) (*template.Template, error) {
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+func renderTemplate(w http.ResponseWriter, data pageData) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := tmpl.Execute(w, data); err != nil {
+		log.Printf("failed to render template: %v", err)
 	}
-	return template.New("body").Funcs(template.FuncMap{"upper": strings.ToUpper}).Parse(string(content))
 }
 
-func loadRecipients(path string) ([]Recipient, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	reader := csv.NewReader(f)
-	reader.TrimLeadingSpace = true
-
-	headers, err := reader.Read()
-	if err != nil {
-		return nil, err
-	}
-
-	for i, h := range headers {
-		headers[i] = strings.ToLower(strings.TrimSpace(h))
-	}
-
-	var recipients []Recipient
-	for {
-		record, err := reader.Read()
-		if errors.Is(err, io.EOF) {
-			break
+func parseRecipients(input string) []string {
+	lines := strings.Split(input, "\n")
+	recipients := make([]string, 0, len(lines))
+	for _, line := range lines {
+		email := strings.TrimSpace(line)
+		if email == "" {
+			continue
 		}
-		if err != nil {
-			return nil, err
-		}
-
-		if len(record) != len(headers) {
-			return nil, fmt.Errorf("recipient record has %d fields, expected %d", len(record), len(headers))
-		}
-
-		r := make(Recipient, len(headers))
-		for i, field := range record {
-			r[headers[i]] = field
-		}
-		recipients = append(recipients, r)
+		recipients = append(recipients, email)
 	}
-
-	return recipients, nil
+	return recipients
 }
 
-func renderBody(tmpl *template.Template, recipient Recipient) (string, error) {
-	var buf bytes.Buffer
-	if err := tmpl.Execute(&buf, recipient); err != nil {
-		return "", err
-	}
-	return buf.String(), nil
-}
-
-func buildMessage(from, to, subject, body string) (string, error) {
-	if strings.TrimSpace(from) == "" {
-		return "", errors.New("from address cannot be empty")
-	}
-	if strings.TrimSpace(to) == "" {
-		return "", errors.New("to address cannot be empty")
-	}
-
-	var msg bytes.Buffer
-	msg.WriteString(fmt.Sprintf("From: %s\r\n", from))
-	msg.WriteString(fmt.Sprintf("To: %s\r\n", to))
-	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
-	msg.WriteString("MIME-Version: 1.0\r\n")
-	msg.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
-	msg.WriteString("Content-Transfer-Encoding: 8bit\r\n\r\n")
-	msg.WriteString(body)
-
-	return msg.String(), nil
+func buildMessage(from, to, subject, body string) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("From: %s\r\n", from))
+	sb.WriteString(fmt.Sprintf("To: %s\r\n", to))
+	sb.WriteString(fmt.Sprintf("Subject: %s\r\n", subject))
+	sb.WriteString("MIME-Version: 1.0\r\n")
+	sb.WriteString("Content-Type: text/plain; charset=\"UTF-8\"\r\n")
+	sb.WriteString("Content-Transfer-Encoding: 8bit\r\n\r\n")
+	sb.WriteString(body)
+	return sb.String()
 }
 
 func sendEmail(server string, port int, username, password, from, to string, msg []byte) error {
