@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/csv"
+	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"net/smtp"
@@ -17,19 +20,27 @@ type pageData struct {
 }
 
 type formData struct {
-	SMTPServer string
-	SMTPPort   string
-	SMTPUser   string
-	From       string
-	Subject    string
-	Body       string
-	Recipients string
+	Subject string
+	Body    string
 }
 
 type sendResult struct {
+	Sender    string
 	Recipient string
 	Success   bool
 	Message   string
+}
+
+type senderConfig struct {
+	Server   string
+	Port     int
+	Username string
+	Password string
+	From     string
+}
+
+type recipientEntry struct {
+	Email string
 }
 
 var tmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
@@ -52,34 +63,24 @@ var tmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
 </head>
 <body>
     <h1>Bulk Mailer</h1>
-    <p>Send a plain-text email to multiple recipients by filling in the SMTP and message details below.</p>
+    <p>Upload CSV files describing your sender accounts and recipients, compose the message once, and deliver it in bulk.</p>
     {{if .Error}}
     <p class="error">{{.Error}}</p>
     {{end}}
-    <form method="post" action="/">
-        <label>SMTP Server
-            <input type="text" name="smtp_server" value="{{.Form.SMTPServer}}" required>
+    <form method="post" action="/" enctype="multipart/form-data">
+        <label>Sender Accounts CSV
+            <input type="file" name="senders_file" accept=".csv" required>
+            <small>Header columns: smtp_server,smtp_port,smtp_user,smtp_pass,from (from is optional).</small>
         </label>
-        <label>SMTP Port
-            <input type="text" name="smtp_port" value="{{.Form.SMTPPort}}" required>
-        </label>
-        <label>SMTP Username
-            <input type="text" name="smtp_user" value="{{.Form.SMTPUser}}" required>
-        </label>
-        <label>SMTP Password
-            <input type="password" name="smtp_pass" value="" placeholder="Not stored" required>
-        </label>
-        <label>From Address
-            <input type="text" name="from" value="{{.Form.From}}" placeholder="Defaults to SMTP username">
+        <label>Recipients CSV
+            <input type="file" name="recipients_file" accept=".csv" required>
+            <small>Header columns: email.</small>
         </label>
         <label>Subject
             <input type="text" name="subject" value="{{.Form.Subject}}" required>
         </label>
         <label>Body
             <textarea name="body" required>{{.Form.Body}}</textarea>
-        </label>
-        <label>Recipients (one email address per line)
-            <textarea name="recipients" required>{{.Form.Recipients}}</textarea>
         </label>
         <button type="submit">Send Emails</button>
     </form>
@@ -89,7 +90,7 @@ var tmpl = template.Must(template.New("page").Parse(`<!DOCTYPE html>
         <h2>Send Results</h2>
         <ul>
             {{range .Results}}
-            <li class="{{if .Success}}result-success{{else}}result-failure{{end}}">{{.Recipient}} — {{.Message}}</li>
+            <li class="{{if .Success}}result-success{{else}}result-failure{{end}}">{{.Sender}} → {{.Recipient}} — {{.Message}}</li>
             {{end}}
         </ul>
     </div>
@@ -108,67 +109,75 @@ func main() {
 }
 
 func formHandler(w http.ResponseWriter, r *http.Request) {
-	data := pageData{
-		Form: formData{
-			SMTPPort: "587",
-		},
-	}
+	data := pageData{}
 
 	if r.Method == http.MethodPost {
-		if err := r.ParseForm(); err != nil {
+		if err := r.ParseMultipartForm(10 << 20); err != nil {
 			data.Error = fmt.Sprintf("failed to parse form: %v", err)
 			renderTemplate(w, data)
 			return
 		}
 
-		data.Form.SMTPServer = strings.TrimSpace(r.FormValue("smtp_server"))
-		data.Form.SMTPPort = strings.TrimSpace(r.FormValue("smtp_port"))
-		data.Form.SMTPUser = strings.TrimSpace(r.FormValue("smtp_user"))
-		password := strings.TrimSpace(r.FormValue("smtp_pass"))
-		data.Form.From = strings.TrimSpace(r.FormValue("from"))
 		data.Form.Subject = strings.TrimSpace(r.FormValue("subject"))
 		data.Form.Body = r.FormValue("body")
-		data.Form.Recipients = strings.TrimSpace(r.FormValue("recipients"))
 
-		if data.Form.SMTPServer == "" || data.Form.SMTPPort == "" || data.Form.SMTPUser == "" || data.Form.Subject == "" || data.Form.Body == "" || data.Form.Recipients == "" {
-			data.Error = "All fields except From are required."
+		if data.Form.Subject == "" || strings.TrimSpace(data.Form.Body) == "" {
+			data.Error = "Subject and body are required."
 			renderTemplate(w, data)
 			return
 		}
 
-		port, err := strconv.Atoi(data.Form.SMTPPort)
+		sendersFile, _, err := r.FormFile("senders_file")
 		if err != nil {
-			data.Error = "SMTP Port must be a number."
+			data.Error = fmt.Sprintf("failed to read senders file: %v", err)
+			renderTemplate(w, data)
+			return
+		}
+		defer sendersFile.Close()
+
+		senders, err := parseSendersCSV(sendersFile)
+		if err != nil {
+			data.Error = fmt.Sprintf("invalid senders CSV: %v", err)
+			renderTemplate(w, data)
+			return
+		}
+		if len(senders) == 0 {
+			data.Error = "Provide at least one sender account in the CSV."
 			renderTemplate(w, data)
 			return
 		}
 
-		recipients := parseRecipients(data.Form.Recipients)
+		recipientsFile, _, err := r.FormFile("recipients_file")
+		if err != nil {
+			data.Error = fmt.Sprintf("failed to read recipients file: %v", err)
+			renderTemplate(w, data)
+			return
+		}
+		defer recipientsFile.Close()
+
+		recipients, err := parseRecipientsCSV(recipientsFile)
+		if err != nil {
+			data.Error = fmt.Sprintf("invalid recipients CSV: %v", err)
+			renderTemplate(w, data)
+			return
+		}
+
 		if len(recipients) == 0 {
-			data.Error = "Provide at least one recipient email address."
-			renderTemplate(w, data)
-			return
-		}
-
-		from := data.Form.From
-		if strings.TrimSpace(from) == "" {
-			from = data.Form.SMTPUser
-		}
-
-		if password == "" {
-			data.Error = "SMTP Password is required to send emails."
+			data.Error = "Provide at least one recipient email address in the CSV."
 			renderTemplate(w, data)
 			return
 		}
 
 		results := make([]sendResult, 0, len(recipients))
-		for _, recipient := range recipients {
-			msg := buildMessage(from, recipient, data.Form.Subject, data.Form.Body)
-			err := sendEmail(data.Form.SMTPServer, port, data.Form.SMTPUser, password, from, recipient, []byte(msg))
+		for i, recipient := range recipients {
+			sender := senders[i%len(senders)]
+			msg := buildMessage(sender.From, recipient.Email, data.Form.Subject, data.Form.Body)
+			err := sendEmail(sender.Server, sender.Port, sender.Username, sender.Password, sender.From, recipient.Email, []byte(msg))
 			if err != nil {
-				log.Printf("Failed to send email to %s: %v", recipient, err)
+				log.Printf("Failed to send email from %s to %s: %v", sender.Username, recipient.Email, err)
 				results = append(results, sendResult{
-					Recipient: recipient,
+					Sender:    sender.Username,
+					Recipient: recipient.Email,
 					Success:   false,
 					Message:   err.Error(),
 				})
@@ -176,7 +185,8 @@ func formHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			results = append(results, sendResult{
-				Recipient: recipient,
+				Sender:    sender.Username,
+				Recipient: recipient.Email,
 				Success:   true,
 				Message:   "sent successfully",
 			})
@@ -195,17 +205,114 @@ func renderTemplate(w http.ResponseWriter, data pageData) {
 	}
 }
 
-func parseRecipients(input string) []string {
-	lines := strings.Split(input, "\n")
-	recipients := make([]string, 0, len(lines))
-	for _, line := range lines {
-		email := strings.TrimSpace(line)
+func parseSendersCSV(r io.Reader) ([]senderConfig, error) {
+	reader := csv.NewReader(r)
+	reader.TrimLeadingSpace = true
+
+	header, err := reader.Read()
+	if err != nil {
+		return nil, fmt.Errorf("reading header: %w", err)
+	}
+
+	colIndex := map[string]int{}
+	for idx, col := range header {
+		normalized := strings.ToLower(strings.TrimSpace(col))
+		colIndex[normalized] = idx
+	}
+
+	required := []string{"smtp_server", "smtp_port", "smtp_user", "smtp_pass"}
+	for _, col := range required {
+		if _, ok := colIndex[col]; !ok {
+			return nil, fmt.Errorf("missing required column %q", col)
+		}
+	}
+
+	fromIdx, hasFrom := colIndex["from"]
+	senders := []senderConfig{}
+
+	for {
+		record, err := reader.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading record: %w", err)
+		}
+
+		server := strings.TrimSpace(record[colIndex["smtp_server"]])
+		portStr := strings.TrimSpace(record[colIndex["smtp_port"]])
+		user := strings.TrimSpace(record[colIndex["smtp_user"]])
+		pass := strings.TrimSpace(record[colIndex["smtp_pass"]])
+
+		if server == "" || portStr == "" || user == "" || pass == "" {
+			return nil, errors.New("sender rows must include smtp_server, smtp_port, smtp_user, and smtp_pass values")
+		}
+
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid port %q for sender %s", portStr, user)
+		}
+
+		from := user
+		if hasFrom {
+			value := strings.TrimSpace(record[fromIdx])
+			if value != "" {
+				from = value
+			}
+		}
+
+		senders = append(senders, senderConfig{
+			Server:   server,
+			Port:     port,
+			Username: user,
+			Password: pass,
+			From:     from,
+		})
+	}
+
+	return senders, nil
+}
+
+func parseRecipientsCSV(r io.Reader) ([]recipientEntry, error) {
+	reader := csv.NewReader(r)
+	reader.TrimLeadingSpace = true
+
+	header, err := reader.Read()
+	if err != nil {
+		return nil, fmt.Errorf("reading header: %w", err)
+	}
+
+	emailIdx := -1
+	for idx, col := range header {
+		if strings.EqualFold(strings.TrimSpace(col), "email") {
+			emailIdx = idx
+			break
+		}
+	}
+
+	if emailIdx == -1 {
+		return nil, errors.New("missing required column \"email\"")
+	}
+
+	recipients := []recipientEntry{}
+	for {
+		record, err := reader.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("reading record: %w", err)
+		}
+
+		email := strings.TrimSpace(record[emailIdx])
 		if email == "" {
 			continue
 		}
-		recipients = append(recipients, email)
+
+		recipients = append(recipients, recipientEntry{Email: email})
 	}
-	return recipients
+
+	return recipients, nil
 }
 
 func buildMessage(from, to, subject, body string) string {
