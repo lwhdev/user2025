@@ -37,20 +37,20 @@ type ProxyPool struct {
 }
 
 var (
-        // tableRe 大致截取 HTML 中的每个表格区块，便于后续提取代理数据。
-        tableRe = regexp.MustCompile(`(?is)<table[^>]*>.*?</table>`)
-        // rowRe 从表格中抽取每一行 <tr>。
-        rowRe = regexp.MustCompile(`(?is)<tr[^>]*>.*?</tr>`)
-        // cellRe 抽取单元格 <td>/<th> 的文本内容。
-        cellRe = regexp.MustCompile(`(?is)<t[dh][^>]*>(.*?)</t[dh]>`)
-        // captionRe 获取表格标题，用作代理池名称。
-        captionRe = regexp.MustCompile(`(?is)<caption[^>]*>(.*?)</caption>`)
-        // tagRe 在清洗单元格文本时去除残留的 HTML 标签。
-        tagRe = regexp.MustCompile(`(?is)<[^>]+>`)
+	// tableRe 大致截取 HTML 中的每个表格区块，便于后续提取代理数据。
+	tableRe = regexp.MustCompile(`(?is)<table[^>]*>.*?</table>`)
+	// rowRe 从表格中抽取每一行 <tr>。
+	rowRe = regexp.MustCompile(`(?is)<tr[^>]*>.*?</tr>`)
+	// cellRe 抽取单元格 <td>/<th> 的文本内容。
+	cellRe = regexp.MustCompile(`(?is)<t[dh][^>]*>(.*?)</t[dh]>`)
+	// captionRe 获取表格标题，用作代理池名称。
+	captionRe = regexp.MustCompile(`(?is)<caption[^>]*>(.*?)</caption>`)
+	// tagRe 在清洗单元格文本时去除残留的 HTML 标签。
+	tagRe = regexp.MustCompile(`(?is)<[^>]+>`)
 )
 
 func main() {
-        // 命令行参数可控制输出格式、目标 URL 以及 HTTP 超时时间。
+	// 命令行参数可控制输出格式、目标 URL 以及 HTTP 超时时间。
 	outputJSON := flag.Bool("json", false, "print result as JSON")
 	url := flag.String("url", "https://list.proxylistplus.com/index.php", "page to scrape")
 	timeout := flag.Duration("timeout", 15*time.Second, "HTTP request timeout")
@@ -147,12 +147,8 @@ func parseProxyPools(htmlDoc string) ([]ProxyPool, error) {
 	}
 
 	var pools []ProxyPool
-	for i, pos := range tables {
+	for _, pos := range tables {
 		tableHTML := htmlDoc[pos[0]:pos[1]]
-		if !strings.Contains(strings.ToLower(tableHTML), "ip address") {
-			continue
-		}
-
 		header, rows := extractRows(tableHTML)
 		if len(header) == 0 || len(rows) == 0 {
 			continue
@@ -177,7 +173,6 @@ func parseProxyPools(htmlDoc string) ([]ProxyPool, error) {
 		}
 
 		pools = append(pools, ProxyPool{Name: poolName, Proxies: proxies})
-		_ = i
 	}
 
 	if len(pools) == 0 {
@@ -230,9 +225,6 @@ func extractCells(rowHTML string) []string {
 	cells := make([]string, 0, len(matches))
 	for _, m := range matches {
 		cleaned := sanitizeText(m[1])
-		if cleaned == "" {
-			continue
-		}
 		cells = append(cells, cleaned)
 	}
 	return cells
