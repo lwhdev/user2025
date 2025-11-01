@@ -245,8 +245,8 @@ func buildProxy(headers, cells []string) (Proxy, bool) {
 		headerIndex[normalized] = idx
 	}
 
-	ipIdx, okIP := findIndex(headerIndex, "ipaddress", "ip", "proxyaddress")
-	portIdx, okPort := findIndex(headerIndex, "port", "portnumber")
+	ipIdx, okIP := findIndex(headerIndex, "ipaddress", "ip", "proxyaddress", "proxyip")
+	portIdx, okPort := findIndex(headerIndex, "port", "portnumber", "proxyport")
 
 	if !okIP || !okPort {
 		return Proxy{}, false
