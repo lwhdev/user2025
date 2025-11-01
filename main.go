@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -8,118 +9,129 @@ import (
 	"html"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
-	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-// Proxy 表示从代理表格中提取的一条记录。
-// 字段全部使用字符串类型，方便应对站点上可能出现的混合格式
-// （例如 "Google" 列可能是 "no" 或 "yes"，而不是布尔值）。
-type Proxy struct {
-	IP          string `json:"ip"`
-	Port        string `json:"port"`
-	Protocol    string `json:"protocol,omitempty"`
-	Country     string `json:"country,omitempty"`
-	Anonymity   string `json:"anonymity,omitempty"`
-	Google      string `json:"google,omitempty"`
-	HTTPS       string `json:"https,omitempty"`
-	LastChecked string `json:"last_checked,omitempty"`
-}
-
-// ProxyPool 根据表格标题或生成的名称对代理进行分组。
-type ProxyPool struct {
-	Name    string  `json:"name"`
-	Proxies []Proxy `json:"proxies"`
-}
+const (
+	// defaultPattern 是 Fresh HTTP Proxy 列表的分页模板，%d 代表页码。
+	defaultPattern = "https://list.proxylistplus.com/Fresh-HTTP-Proxy-List-%d"
+)
 
 var (
-	// tableRe 大致截取 HTML 中的每个表格区块，便于后续提取代理数据。
-	tableRe = regexp.MustCompile(`(?is)<table[^>]*>.*?</table>`)
-	// rowRe 从表格中抽取每一行 <tr>。
-	rowRe = regexp.MustCompile(`(?is)<tr[^>]*>.*?</tr>`)
-	// cellRe 抽取单元格 <td>/<th> 的文本内容。
+	// proxyRowRe 捕获代理数据所在的每一行。
+	proxyRowRe = regexp.MustCompile(`(?is)<tr[^>]*class\s*=\s*['\"]?cells2?['\"]?[^>]*>.*?</tr>`)
+	// cellRe 抽取单元格内的原始 HTML 内容。
 	cellRe = regexp.MustCompile(`(?is)<t[dh][^>]*>(.*?)</t[dh]>`)
-	// captionRe 获取表格标题，用作代理池名称。
-	captionRe = regexp.MustCompile(`(?is)<caption[^>]*>(.*?)</caption>`)
-	// tagRe 在清洗单元格文本时去除残留的 HTML 标签。
+	// tagRe 用于从单元格文本中移除残留的标签。
 	tagRe = regexp.MustCompile(`(?is)<[^>]+>`)
+	// digitRe 用于解析端口号中的数字。
+	digitRe = regexp.MustCompile(`\d+`)
 )
 
+// Proxy 表示解析得到的一条代理记录。
+type Proxy struct {
+	IP         string `json:"ip"`
+	Port       string `json:"port"`
+	Type       string `json:"type,omitempty"`
+	Country    string `json:"country,omitempty"`
+	Google     string `json:"google,omitempty"`
+	HTTPS      string `json:"https,omitempty"`
+	SourcePage int    `json:"page"`
+}
+
 func main() {
-	// 命令行参数可控制输出格式、目标 URL 以及 HTTP 超时时间。
-	outputJSON := flag.Bool("json", false, "print result as JSON")
-	url := flag.String("url", "https://list.proxylistplus.com/index.php", "page to scrape")
-	timeout := flag.Duration("timeout", 15*time.Second, "HTTP request timeout")
+	outputDir := flag.String("output", "output", "保存抓取结果的根目录")
+	pageCount := flag.Int("pages", 6, "需要抓取的页数")
+	timeout := flag.Duration("timeout", 20*time.Second, "HTTP 请求超时时间")
+	pattern := flag.String("pattern", defaultPattern, "分页 URL 模板（必须包含一个 %d 占位符）")
 	flag.Parse()
 
-	pools, err := FetchProxyPools(*url, *timeout)
-	if err != nil {
-		log.Fatalf("failed to fetch proxies: %v", err)
+	if *pageCount <= 0 {
+		log.Fatalf("pages 必须大于 0")
+	}
+	if !strings.Contains(*pattern, "%d") {
+		log.Fatalf("pattern 必须包含 %%d 以替换页码")
 	}
 
-	if *outputJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(pools); err != nil {
-			log.Fatalf("failed to encode JSON: %v", err)
-		}
-		return
+	if err := os.MkdirAll(*outputDir, 0o755); err != nil {
+		log.Fatalf("创建输出目录失败: %v", err)
 	}
 
-	for _, pool := range pools {
-		fmt.Printf("=== %s ===\n", pool.Name)
-		for _, proxy := range pool.Proxies {
-			fmt.Printf("%s:%s", proxy.IP, proxy.Port)
-			extra := buildExtra(proxy)
-			if extra != "" {
-				fmt.Printf("\t%s", extra)
-			}
-			fmt.Println()
+	htmlDir := filepath.Join(*outputDir, "html")
+	proxiesDir := filepath.Join(*outputDir, "proxies")
+	for _, dir := range []string{htmlDir, proxiesDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Fatalf("创建子目录失败: %v", err)
 		}
-		fmt.Println()
 	}
+
+	client := &http.Client{Timeout: *timeout}
+	var allProxies []Proxy
+
+	for page := 1; page <= *pageCount; page++ {
+		pageURL := fmt.Sprintf(*pattern, page)
+		body, err := downloadPage(client, pageURL)
+		if err != nil {
+			log.Fatalf("抓取第 %d 页失败: %v", page, err)
+		}
+
+		htmlPath := filepath.Join(htmlDir, fmt.Sprintf("page-%d.html", page))
+		if err := os.WriteFile(htmlPath, body, 0o644); err != nil {
+			log.Fatalf("保存第 %d 页 HTML 失败: %v", page, err)
+		}
+
+		proxies, err := parseFreshProxyPage(string(body))
+		if err != nil {
+			log.Fatalf("解析第 %d 页代理失败: %v", page, err)
+		}
+		for i := range proxies {
+			proxies[i].SourcePage = page
+		}
+
+		pageListPath := filepath.Join(proxiesDir, fmt.Sprintf("page-%d.txt", page))
+		if err := saveProxyText(pageListPath, proxies); err != nil {
+			log.Fatalf("保存第 %d 页代理列表失败: %v", page, err)
+		}
+
+		allProxies = append(allProxies, proxies...)
+		log.Printf("第 %d 页解析到 %d 条代理", page, len(proxies))
+	}
+
+	if len(allProxies) == 0 {
+		log.Fatal("未解析到任何代理数据")
+	}
+
+	summaryTextPath := filepath.Join(*outputDir, "proxies.txt")
+	if err := saveProxyText(summaryTextPath, allProxies); err != nil {
+		log.Fatalf("保存汇总代理文本失败: %v", err)
+	}
+
+	summaryJSONPath := filepath.Join(*outputDir, "proxies.json")
+	if err := saveProxyJSON(summaryJSONPath, allProxies); err != nil {
+		log.Fatalf("保存汇总代理 JSON 失败: %v", err)
+	}
+
+	log.Printf("共保存 %d 条代理，输出目录：%s", len(allProxies), *outputDir)
 }
 
-// buildExtra 将可选字段整理成便于阅读的字符串。
-func buildExtra(p Proxy) string {
-	var items []string
-	add := func(label, value string) {
-		if value == "" {
-			return
-		}
-		items = append(items, fmt.Sprintf("%s=%s", label, value))
-	}
-
-	add("protocol", p.Protocol)
-	add("country", p.Country)
-	add("anonymity", p.Anonymity)
-	add("google", p.Google)
-	add("https", p.HTTPS)
-	add("last_checked", p.LastChecked)
-
-	if len(items) == 0 {
-		return ""
-	}
-
-	sort.Strings(items)
-	return strings.Join(items, ", ")
-}
-
-// FetchProxyPools 下载目标页面并从中解析代理池。
-func FetchProxyPools(url string, timeout time.Duration) ([]ProxyPool, error) {
-	client := &http.Client{Timeout: timeout}
+// downloadPage 负责发起 HTTP 请求并返回页面内容。
+func downloadPage(client *http.Client, url string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; ProxyCrawler/1.0; +https://example.com)")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; ProxyCrawler/2.0; +https://example.com)")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -128,171 +140,145 @@ func FetchProxyPools(url string, timeout time.Duration) ([]ProxyPool, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status %s", resp.Status)
+		return nil, fmt.Errorf("响应状态码异常: %s", resp.Status)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-
-	return parseProxyPools(string(body))
+	return body, nil
 }
 
-// parseProxyPools 找到页面中相关的代理表格并转换为结构化的 ProxyPool 列表。
-func parseProxyPools(htmlDoc string) ([]ProxyPool, error) {
-	tables := tableRe.FindAllStringIndex(htmlDoc, -1)
-	if len(tables) == 0 {
-		return nil, errors.New("no tables found in page")
+// parseFreshProxyPage 解析 Fresh HTTP Proxy 页面中的代理行。
+func parseFreshProxyPage(doc string) ([]Proxy, error) {
+	rows := proxyRowRe.FindAllString(doc, -1)
+	if len(rows) == 0 {
+		return nil, errors.New("页面中未找到代理数据行")
 	}
 
-	var pools []ProxyPool
-	for _, pos := range tables {
-		tableHTML := htmlDoc[pos[0]:pos[1]]
-		header, rows := extractRows(tableHTML)
-		if len(header) == 0 || len(rows) == 0 {
-			continue
-		}
-
-		proxies := make([]Proxy, 0, len(rows))
-		for _, cells := range rows {
-			proxy, ok := buildProxy(header, cells)
-			if !ok {
-				continue
-			}
-			proxies = append(proxies, proxy)
-		}
-
-		if len(proxies) == 0 {
-			continue
-		}
-
-		poolName := extractTableTitle(tableHTML)
-		if poolName == "" {
-			poolName = fmt.Sprintf("Proxy Pool %d", len(pools)+1)
-		}
-
-		pools = append(pools, ProxyPool{Name: poolName, Proxies: proxies})
-	}
-
-	if len(pools) == 0 {
-		return nil, errors.New("no proxy tables detected")
-	}
-
-	return pools, nil
-}
-
-// extractTableTitle 返回表格的标题（若存在）。
-func extractTableTitle(tableHTML string) string {
-	match := captionRe.FindStringSubmatch(tableHTML)
-	if match == nil {
-		return ""
-	}
-	return sanitizeText(match[1])
-}
-
-// extractRows 将表格拆分为表头和数据行。
-func extractRows(tableHTML string) ([]string, [][]string) {
-	matches := rowRe.FindAllString(tableHTML, -1)
-	if len(matches) == 0 {
-		return nil, nil
-	}
-
-	headerCells := extractCells(matches[0])
-	if len(headerCells) == 0 {
-		return nil, nil
-	}
-
-	var data [][]string
-	for _, row := range matches[1:] {
-		cells := extractCells(row)
+	var proxies []Proxy
+	for _, rowHTML := range rows {
+		cells := cellRe.FindAllStringSubmatch(rowHTML, -1)
 		if len(cells) == 0 {
 			continue
 		}
-		data = append(data, cells)
+
+		values := make([]string, 0, len(cells))
+		for _, c := range cells {
+			values = append(values, sanitizeText(c[1]))
+		}
+
+		ipIdx := findIPIndex(values)
+		if ipIdx == -1 || ipIdx+1 >= len(values) {
+			continue
+		}
+
+		ip := values[ipIdx]
+		port := normalizePort(values[ipIdx+1])
+		if ip == "" || port == "" {
+			continue
+		}
+
+		proxy := Proxy{IP: ip, Port: port}
+		if ipIdx+2 < len(values) {
+			proxy.Type = values[ipIdx+2]
+		}
+		if ipIdx+3 < len(values) {
+			proxy.Country = values[ipIdx+3]
+		}
+		if ipIdx+4 < len(values) {
+			proxy.Google = values[ipIdx+4]
+		}
+		if ipIdx+5 < len(values) {
+			proxy.HTTPS = values[ipIdx+5]
+		}
+
+		proxies = append(proxies, proxy)
 	}
 
-	return headerCells, data
+	if len(proxies) == 0 {
+		return nil, errors.New("未能从页面提取任何有效的代理 IP")
+	}
+
+	return proxies, nil
 }
 
-// extractCells 清洗一行内容并返回单元格值。
-func extractCells(rowHTML string) []string {
-	matches := cellRe.FindAllStringSubmatch(rowHTML, -1)
-	if len(matches) == 0 {
-		return nil
-	}
-
-	cells := make([]string, 0, len(matches))
-	for _, m := range matches {
-		cleaned := sanitizeText(m[1])
-		cells = append(cells, cleaned)
-	}
-	return cells
-}
-
-// sanitizeText 去除 HTML 标签并规范空白字符。
-func sanitizeText(input string) string {
-	withoutTags := tagRe.ReplaceAllString(input, "")
-	trimmed := strings.TrimSpace(html.UnescapeString(withoutTags))
-	return strings.Join(strings.Fields(trimmed), " ")
-}
-
-// buildProxy 根据表头映射单元格内容，构造 Proxy。
-func buildProxy(headers, cells []string) (Proxy, bool) {
-	headerIndex := make(map[string]int, len(headers))
-	for idx, header := range headers {
-		normalized := normalizeHeader(header)
-		headerIndex[normalized] = idx
-	}
-
-	ipIdx, okIP := findIndex(headerIndex, "ipaddress", "ip", "proxyaddress", "proxyip")
-	portIdx, okPort := findIndex(headerIndex, "port", "portnumber", "proxyport")
-
-	if !okIP || !okPort {
-		return Proxy{}, false
-	}
-
-	if ipIdx >= len(cells) || portIdx >= len(cells) {
-		return Proxy{}, false
-	}
-
-	proxy := Proxy{IP: cells[ipIdx], Port: cells[portIdx]}
-
-	if idx, ok := findIndex(headerIndex, "protocol", "type"); ok && idx < len(cells) {
-		proxy.Protocol = cells[idx]
-	}
-	if idx, ok := findIndex(headerIndex, "country", "nation"); ok && idx < len(cells) {
-		proxy.Country = cells[idx]
-	}
-	if idx, ok := findIndex(headerIndex, "anonymity", "anon", "level"); ok && idx < len(cells) {
-		proxy.Anonymity = cells[idx]
-	}
-	if idx, ok := findIndex(headerIndex, "google"); ok && idx < len(cells) {
-		proxy.Google = cells[idx]
-	}
-	if idx, ok := findIndex(headerIndex, "https", "ssl"); ok && idx < len(cells) {
-		proxy.HTTPS = cells[idx]
-	}
-	if idx, ok := findIndex(headerIndex, "lastchecked", "lastupdate", "updated"); ok && idx < len(cells) {
-		proxy.LastChecked = cells[idx]
-	}
-
-	return proxy, true
-}
-
-// normalizeHeader 扁平化表头字符串，容忍空格、标点、大小写等细微差异。
-func normalizeHeader(header string) string {
-	lowered := strings.ToLower(header)
-	replacer := strings.NewReplacer(" ", "", "-", "", "_", "", ":", "", "#", "", "?", "")
-	return replacer.Replace(lowered)
-}
-
-// findIndex 返回匹配给定键的首个下标。
-func findIndex(index map[string]int, keys ...string) (int, bool) {
-	for _, key := range keys {
-		if idx, ok := index[key]; ok {
-			return idx, true
+// findIPIndex 返回切片中首个合法 IP 地址的下标。
+func findIPIndex(values []string) int {
+	for idx, value := range values {
+		if net.ParseIP(value) != nil {
+			return idx
 		}
 	}
-	return 0, false
+	return -1
+}
+
+// normalizePort 提取并验证端口号。
+func normalizePort(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	digits := digitRe.FindString(trimmed)
+	if digits == "" {
+		return ""
+	}
+	port, err := strconv.Atoi(digits)
+	if err != nil || port <= 0 || port > 65535 {
+		return ""
+	}
+	return digits
+}
+
+// sanitizeText 去除标签、解码实体并压缩空白字符。
+func sanitizeText(input string) string {
+	if input == "" {
+		return ""
+	}
+	noTags := tagRe.ReplaceAllString(input, "")
+	decoded := html.UnescapeString(noTags)
+	safe := stripInvalidUTF8(decoded)
+	fields := strings.Fields(safe)
+	return strings.Join(fields, " ")
+}
+
+// stripInvalidUTF8 去除非法的 UTF-8 字符，避免写文件时报错。
+func stripInvalidUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	buf := make([]rune, 0, len(s))
+	for _, r := range s {
+		if r == utf8.RuneError {
+			continue
+		}
+		buf = append(buf, r)
+	}
+	return string(buf)
+}
+
+// saveProxyText 以 ip:port 形式写入文本文件。
+func saveProxyText(path string, proxies []Proxy) error {
+	var builder strings.Builder
+	for idx, proxy := range proxies {
+		if idx > 0 {
+			builder.WriteByte('\n')
+		}
+		builder.WriteString(proxy.IP)
+		builder.WriteByte(':')
+		builder.WriteString(proxy.Port)
+	}
+	return os.WriteFile(path, []byte(builder.String()), 0o644)
+}
+
+// saveProxyJSON 以 JSON 格式写入代理数组。
+func saveProxyJSON(path string, proxies []Proxy) error {
+	buf := &bytes.Buffer{}
+	enc := json.NewEncoder(buf)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(proxies); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o644)
 }
