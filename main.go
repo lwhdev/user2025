@@ -51,6 +51,7 @@ func main() {
 	outputDir := flag.String("output", "output", "保存抓取结果的根目录")
 	pageCount := flag.Int("pages", 6, "需要抓取的页数")
 	timeout := flag.Duration("timeout", 20*time.Second, "HTTP 请求超时时间")
+	probeTimeout := flag.Duration("probe-timeout", 3*time.Second, "探测代理连通性的超时时间（小于等于 0 表示跳过探测）")
 	pattern := flag.String("pattern", defaultPattern, "分页 URL 模板（必须包含一个 %d 占位符）")
 	flag.Parse()
 
@@ -96,17 +97,24 @@ func main() {
 			proxies[i].SourcePage = page
 		}
 
+		validProxies := proxies
+		if *probeTimeout > 0 {
+			validProxies = filterReachableProxies(proxies, *probeTimeout)
+			log.Printf("第 %d 页可用代理 %d/%d", page, len(validProxies), len(proxies))
+		} else {
+			log.Printf("第 %d 页共解析到 %d 条代理（跳过连通性探测）", page, len(proxies))
+		}
+
 		pageListPath := filepath.Join(proxiesDir, fmt.Sprintf("page-%d.txt", page))
-		if err := saveProxyText(pageListPath, proxies); err != nil {
+		if err := saveProxyText(pageListPath, validProxies); err != nil {
 			log.Fatalf("保存第 %d 页代理列表失败: %v", page, err)
 		}
 
-		allProxies = append(allProxies, proxies...)
-		log.Printf("第 %d 页解析到 %d 条代理", page, len(proxies))
+		allProxies = append(allProxies, validProxies...)
 	}
 
 	if len(allProxies) == 0 {
-		log.Fatal("未解析到任何代理数据")
+		log.Fatal("未解析到任何可用代理数据")
 	}
 
 	summaryTextPath := filepath.Join(*outputDir, "proxies.txt")
@@ -229,6 +237,31 @@ func normalizePort(raw string) string {
 		return ""
 	}
 	return digits
+}
+
+// filterReachableProxies 返回在给定超时内可连通的代理。
+func filterReachableProxies(proxies []Proxy, timeout time.Duration) []Proxy {
+	reachable := make([]Proxy, 0, len(proxies))
+	for _, proxy := range proxies {
+		if err := checkProxyReachable(proxy, timeout); err != nil {
+			log.Printf("剔除不可用代理 %s:%s: %v", proxy.IP, proxy.Port, err)
+			continue
+		}
+		reachable = append(reachable, proxy)
+	}
+	return reachable
+}
+
+// checkProxyReachable 判断代理 IP:Port 是否可建立 TCP 连接。
+func checkProxyReachable(proxy Proxy, timeout time.Duration) error {
+	address := net.JoinHostPort(proxy.IP, proxy.Port)
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.Dial("tcp", address)
+	if err != nil {
+		return err
+	}
+	conn.Close()
+	return nil
 }
 
 // sanitizeText 去除标签、解码实体并压缩空白字符。
